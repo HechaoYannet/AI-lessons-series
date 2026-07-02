@@ -378,3 +378,73 @@ def ai_chat(history: str, pet_name: str, mood: str, stats: dict[str, float]) -> 
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read())
         return data["choices"][0]["message"]["content"].strip()
+
+
+def ai_chat_stream(history: str, pet_name: str, mood: str, stats: dict[str, float], token_queue) -> None:
+    """Stream AI response tokens into token_queue. Puts None when done.
+
+    Intended to be run in a background thread so the main loop stays responsive.
+    """
+    import json
+    import urllib.request
+
+    cfg = _load_config()
+    ai_cfg = cfg.get("ai", {})
+    api_key = ai_cfg.get("api_key", "")
+    model = ai_cfg.get("model", "gpt-4o-mini")
+    base_url = ai_cfg.get("base_url", "https://api.openai.com/v1")
+    max_tokens = ai_cfg.get("max_tokens", 150)
+    temperature = ai_cfg.get("temperature", 0.9)
+    stats_text = ", ".join(f"{k}:{v:.0f}" for k, v in stats.items())
+
+    system_prompt = (
+        f"你是一只名叫{pet_name}的电子宠物。当前情绪{mood}。"
+        f"属性：{stats_text}。"
+        f"用简短、可爱、温暖的方式回复（1-3句话），偶尔加入颜文字。"
+        f"你会根据属性值调整语气。"
+    )
+
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"对话历史:\n{history}\n\n请回复用户最后一条消息。"},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": True,
+    }).encode()
+
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            for line in resp:
+                line = line.decode("utf-8", errors="replace").strip()
+                if not line or line == "data: [DONE]":
+                    continue
+                if line.startswith("data: "):
+                    try:
+                        chunk = json.loads(line[6:])
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            token_queue.put(content)
+                    except json.JSONDecodeError:
+                        pass
+    except Exception as e:
+        try:
+            token_queue.put(f"（AI 响应失败：{e}）")
+        except Exception:
+            pass
+    finally:
+        try:
+            token_queue.put(None)
+        except Exception:
+            pass

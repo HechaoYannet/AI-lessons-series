@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import math
 import os
+import queue
 import random
 import shutil
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,7 +19,7 @@ from animation import (
     make_pet_frame_small,
     make_pet_frame_large,
 )
-from dialogue import DialogueSystem, ai_available, ai_chat
+from dialogue import DialogueSystem, ai_available, ai_chat_stream
 from games import (
     ExplorationSystem,
     NumberGame,
@@ -140,6 +142,10 @@ class PetState:
     chat_reply: str = ""
     typing_progress: float = 0.0
     chat_scroll: int = 0
+    chat_pending: bool = False
+    chat_spin: float = 0.0
+    chat_queue: object | None = None  # queue.Queue for streaming tokens
+    chat_stream_thread: threading.Thread | None = None
 
     # Games
     reaction_game: ReactionGame | None = None
@@ -232,6 +238,10 @@ class PetState:
         # Chat typing effect
         if self.chat_reply and self.typing_progress < len(self.chat_reply):
             self.typing_progress += dt * random.uniform(8, 18)
+
+        # Spinner for pending AI response
+        if self.chat_pending:
+            self.chat_spin += dt * 3.0
 
         self.update_mood()
 
@@ -364,6 +374,8 @@ class TerminalPet:
                 user_input = self.pet.chat_input.strip()
                 self.pet.chat_input = ""
                 if not user_input:
+                    self.pet.chat_reply = "（输入内容不能为空哦）"
+                    self.pet.typing_progress = 0.0
                     return
                 # Number game mode
                 if self.pet.number_game is not None and self.pet.number_game.active:
@@ -379,15 +391,25 @@ class TerminalPet:
                                 self.pet.action("spark")
                         return
                     except ValueError:
-                        self.pet.chat_reply = "请输入数字！（输入 /quit 退出）"
+                        self.pet.chat_reply = "请输入数字！"
                         self.pet.typing_progress = 0.0
                         return
                 # Chat mode
                 stats = self.pet.stats()
                 if ai_available():
                     self.pet.dialogue.context.append(f"你: {user_input}")
-                    self.pet.chat_reply = "[AI思考中...]"
+                    self.pet.chat_reply = ""
                     self.pet.typing_progress = 0.0
+                    self.pet.chat_pending = True
+                    self.pet.chat_spin = 0.0
+                    history = self.pet.dialogue.build_ai_context()
+                    self.pet.chat_queue = queue.Queue()
+                    self.pet.chat_stream_thread = threading.Thread(
+                        target=ai_chat_stream,
+                        args=(history, self.pet.name, self.pet.mood, stats, self.pet.chat_queue),
+                        daemon=True,
+                    )
+                    self.pet.chat_stream_thread.start()
                 else:
                     reply = self.pet.dialogue.respond(user_input, self.pet.mood, stats)
                     self.pet.chat_reply = reply
@@ -397,6 +419,8 @@ class TerminalPet:
                 self.pet.chatting = False
                 self.pet.chat_input = ""
                 self.pet.chat_reply = ""
+                self.pet.chat_pending = False
+                self.pet.chat_queue = None
                 if self.pet.number_game is not None:
                     self.pet.number_game.active = False
                 self.pet.message = "已退出对话。"
@@ -574,72 +598,30 @@ class TerminalPet:
             f"{c('38;5;246')}最近动作{RESET} {self.pet.last_action}",
         ]
 
-        # Game / chat / explore overlays
-        extra_lines: list[str] = []
-
-        # Chat history window (always visible if history exists)
-        if self.pet.dialogue is not None and self.pet.dialogue.history:
-            visible_rows = 5
-            history = self.pet.dialogue.history
-            total = len(history)
-            # chat_scroll=0 means showing latest messages
-            start = max(0, total - visible_rows - self.pet.chat_scroll)
-            end = total - self.pet.chat_scroll
-            visible = history[start:end]
-
-            extra_lines.append(
-                f"{c('38;5;214')}╭─ 聊天记录 {'▼' if start > 0 else '┈'}"
-                f"{'▲' if end < total else '┈'} ──────╮{RESET}"
-            )
-            if not visible:
-                extra_lines.append(f"{c('38;5;214')}│{RESET} (滚动查看更早的消息)        {c('38;5;214')}│{RESET}")
-            for user_msg, pet_msg in visible:
-                # Truncate long messages for display
-                max_len = 35
-                u_disp = user_msg if len(user_msg) <= max_len else user_msg[:max_len - 1] + "…"
-                p_disp = pet_msg if len(pet_msg) <= max_len else pet_msg[:max_len - 1] + "…"
-                extra_lines.append(
-                    f"{c('38;5;214')}│{RESET} {c('38;5;246')}你:{RESET} {u_disp}"
-                )
-                extra_lines.append(
-                    f"{c('38;5;214')}│{RESET} {c('38;5;123')}{self.pet.name}:{RESET} {p_disp}"
-                )
-            extra_lines.append(f"{c('38;5;214')}╰────────────────────────────────────╯{RESET}")
-
-        # Chat input line
-        if self.pet.chatting:
-            if self.pet.chat_input:
-                extra_lines.append(f"{c('38;5;214')}> {RESET}{self.pet.chat_input}_")
-            else:
-                extra_lines.append(f"{c('38;5;214')}> {RESET}_")
-            if self.pet.chat_reply:
-                visible = self.pet.chat_reply[:int(self.pet.typing_progress)]
-                prefix = "[AI] " if ai_available() and self.pet.chat_reply != "[AI思考中...]" else ""
-                extra_lines.append(f"  {c('38;5;123')}{prefix}{visible}{RESET}")
-
-        # Game overlays
+        # Inline overlays (game / explore / stage — stay in right panel)
+        inline_extra: list[str] = []
         if self.pet.reaction_game is not None and self.pet.reaction_game.active:
             rendered = self.pet.reaction_game.render().strip()
             if rendered:
-                extra_lines.append(rendered)
+                inline_extra.append(rendered)
         if self.pet.number_game is not None and self.pet.number_game.active:
             for line in self.pet.number_game.render().strip().split("\n"):
                 if line.strip():
-                    extra_lines.append(line)
+                    inline_extra.append(line)
         if self.pet.explore is not None and self.pet.explore.exploring:
             path = self.pet.explore.render_path(width - 10)
-            extra_lines.append(f"{c('38;5;87')}探索中{RESET}  {path}")
+            inline_extra.append(f"{c('38;5;87')}探索中{RESET}  {path}")
         if self.pet.current_stage and self.pet.current_stage != "成长期":
-            extra_lines.append(f"{c('38;5;220')}阶段{RESET}    {self.pet.current_stage}")
-
-        if extra_lines:
-            info = info + extra_lines
+            inline_extra.append(f"{c('38;5;220')}阶段{RESET}    {self.pet.current_stage}")
+        if inline_extra:
+            info = info + inline_extra
 
         stat_lines = []
         colors = ["38;5;214", "38;5;123", "38;5;213", "38;5;45", "38;5;87", "38;5;159"]
         for (label, value), color in zip(self.pet.stats().items(), colors, strict=False):
             stat_lines.append(self.meter(label, value, color))
 
+        # ── Main panel: pet (left) + info/stats (right) ──
         panel_width = max(width - 4, 20)
         total_rows = max(len(pet_lines), len(info) + len(stat_lines) + 2) + 2
         for i in range(total_rows):
@@ -661,19 +643,100 @@ class TerminalPet:
             lines.append(combined)
 
         if self.help_visible:
-            help_text = [
-                f"{c('38;5;246')}提示{RESET}  宠物会随时间变饿、变累、变脏；你可以通过操作影响它的情绪和外观。",
-                f"{c('38;5;246')}玩法{RESET}  尽量维持快乐、清洁、精力和亲密的平衡。t对话 e探索 g游戏。",
+            help_text_lines = [
+                f"{c('38;5;246')}提示{RESET}  宠物会随时间变饿变累变脏；你可以通过操作影响它的情绪和外观。",
+                f"{c('38;5;246')}玩法{RESET}  维持各项属性的平衡。t对话 e探索 g游戏。↑↓滚动聊天记录。",
             ]
-            for text in help_text:
+            for text in help_text_lines:
                 text_pad = max(0, width - 4 - self._visible_len(text))
                 lines.append(f"{c('38;5;45')}│{RESET} {text}{' ' * text_pad} {c('38;5;45')}│{RESET}")
 
-        while len(lines) < height - 2:
-            lines.append(f"{c('38;5;45')}│{RESET}{' ' * max(0, width - 2)}{c('38;5;45')}│{RESET}")
-
         lines.append(bottom)
+
+        # ── Below main panel: chat history (full width) ──
+        chat_lines: list[str] = []
+
+        if self.pet.dialogue is not None and self.pet.dialogue.history and (self.pet.chatting or not self.help_visible):
+            visible_rows = 5
+            history = self.pet.dialogue.history
+            total = len(history)
+            start = max(0, total - visible_rows - self.pet.chat_scroll)
+            end = total - self.pet.chat_scroll
+            visible = history[start:end]
+
+            chat_width = max(width - 4, 40)
+            bar = "─" * (chat_width - 12)
+            up_marker = "▼" if start > 0 else "─"
+            dn_marker = "▲" if end < total else "─"
+            chat_lines.append(
+                f" {c('38;5;214')}╭─ 聊天记录 {up_marker}{bar}{dn_marker} ╮{RESET}"
+            )
+            if not visible:
+                chat_lines.append(
+                    f" {c('38;5;214')}│{RESET} (按 ↑↓ 滚动查看更早的消息)    {c('38;5;214')}│{RESET}"
+                )
+            for user_msg, pet_msg in visible:
+                max_len = chat_width - 10
+                u_disp = user_msg if len(user_msg) <= max_len else user_msg[:max_len - 1] + "…"
+                p_disp = pet_msg if len(pet_msg) <= max_len else pet_msg[:max_len - 1] + "…"
+                chat_lines.append(
+                    f" {c('38;5;214')}│{RESET} {c('38;5;246')}你:{RESET} {u_disp}"
+                )
+                chat_lines.append(
+                    f" {c('38;5;214')}│{RESET} {c('38;5;123')}{self.pet.name}:{RESET} {p_disp}"
+                )
+            chat_lines.append(
+                f" {c('38;5;214')}╰{'─' * (chat_width - 2)}╯{RESET}"
+            )
+
+        # Chat input line
+        if self.pet.chatting:
+            input_text = self.pet.chat_input if self.pet.chat_input else ""
+            # Show spinner while waiting for AI
+            if self.pet.chat_pending:
+                spin_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+                idx = int(self.pet.chat_spin) % len(spin_chars)
+                spinner = f"{c('38;5;214')}{spin_chars[idx]}{RESET}"
+                chat_lines.append(f" {spinner} {c('38;5;214')}> {RESET}{input_text}_")
+            else:
+                chat_lines.append(f" {c('38;5;214')}> {RESET}{input_text}_")
+            if self.pet.chat_reply:
+                if self.pet.chat_pending:
+                    # Streaming mode — show accumulated text directly
+                    chat_lines.append(f"   {c('38;5;123')}{self.pet.chat_reply}{RESET}")
+                else:
+                    visible_r = self.pet.chat_reply[:int(self.pet.typing_progress)]
+                    prefix = "[AI] " if ai_available() else ""
+                    chat_lines.append(f"   {c('38;5;123')}{prefix}{visible_r}{RESET}")
+            elif self.pet.chat_pending:
+                chat_lines.append(f"   {c('38;5;214')}等待回复...{RESET}")
+
+        # Pad chat_lines to their actual height to avoid flicker
+        lines.extend(chat_lines)
+
+        # Pad remaining space
+        while len(lines) < height - 1:
+            lines.append("")
+
         return "\n".join(lines)
+
+    def _process_stream(self) -> None:
+        """Consume available tokens from the streaming queue (non-blocking)."""
+        q = self.pet.chat_queue
+        if q is None:
+            return
+        try:
+            while True:
+                token = q.get_nowait()
+                if token is None:
+                    self.pet.chat_queue = None
+                    self.pet.chat_pending = False
+                    last_user = self.pet.dialogue.context[-1].replace("你: ", "")
+                    self.pet.dialogue.history.append((last_user, self.pet.chat_reply))
+                    break
+                self.pet.chat_reply += token
+        except queue.Empty:
+            pass
 
     def frame(self) -> None:
         cols, rows = terminal_size()
@@ -681,27 +744,9 @@ class TerminalPet:
         dt = min(0.08, now - self.last_frame)
         self.last_frame = now
         self.read_input()
-
-        # Handle AI chat response (one-shot per message)
-        if self.pet.chat_reply == "[AI思考中...]" and ai_available():
-            try:
-                history = self.pet.dialogue.build_ai_context()
-                stats = self.pet.stats()
-                reply = ai_chat(history, self.pet.name, self.pet.mood, stats)
-                self.pet.chat_reply = reply
-                self.pet.typing_progress = 0.0
-                # Store in dialogue history
-                last_user = self.pet.dialogue.context[-1].replace("你: ", "")
-                self.pet.dialogue.history.append((last_user, reply))
-            except Exception:
-                stats = self.pet.stats()
-                reply = self.pet.dialogue.respond(
-                    "（AI不可用，切换本地模式）", self.pet.mood, stats
-                )
-                self.pet.chat_reply = reply
-                self.pet.typing_progress = 0.0
-
         self.pet.tick(dt)
+
+        self._process_stream()
 
         sys.stdout.write(f"{ESC}[H{ESC}[?7l")
         hide_cursor()
