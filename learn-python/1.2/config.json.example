@@ -1,0 +1,7 @@
+{
+  "ai": {
+    "api_key": "sk-your-api-key-here",
+    "model": "gpt-4o-mini",
+    "base_url": "https://api.openai.com/v1"
+  }
+}
