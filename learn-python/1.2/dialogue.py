@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import random
-from collections import deque
 from dataclasses import dataclass, field
 
 
@@ -251,8 +250,13 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
 class DialogueSystem:
     """Local keyword dialogue engine with context memory."""
 
-    context: deque[str] = field(default_factory=lambda: deque(maxlen=5))
+    context: list[str] = field(default_factory=list)
+    history: list[tuple[str, str]] = field(default_factory=list)
     _used: dict[str, set[str]] = field(default_factory=dict)
+
+    def _context_limit(self) -> int:
+        cfg = _load_config()
+        return cfg.get("ai", {}).get("context_size", 50)
 
     def _detect_intent(self, text: str) -> str:
         scores: dict[str, int] = {}
@@ -280,6 +284,12 @@ class DialogueSystem:
         chosen = random.choice(fresh)
         self._used[key].add(chosen)
         self.context.append(f"你: {text}")
+        # Trim context to configured limit
+        limit = self._context_limit()
+        if len(self.context) > limit:
+            self.context = self.context[-limit:]
+        # Store in displayable history
+        self.history.append((text, chosen))
 
         if intent == "status_ask":
             low_stats = [k for k, v in stats.items() if v < 35]
@@ -336,6 +346,8 @@ def ai_chat(history: str, pet_name: str, mood: str, stats: dict[str, float]) -> 
     api_key = ai_cfg.get("api_key", "")
     model = ai_cfg.get("model", "gpt-4o-mini")
     base_url = ai_cfg.get("base_url", "https://api.openai.com/v1")
+    max_tokens = ai_cfg.get("max_tokens", 150)
+    temperature = ai_cfg.get("temperature", 0.9)
     stats_text = ", ".join(f"{k}:{v:.0f}" for k, v in stats.items())
 
     system_prompt = (
@@ -351,8 +363,8 @@ def ai_chat(history: str, pet_name: str, mood: str, stats: dict[str, float]) -> 
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"对话历史:\n{history}\n\n请回复用户最后一条消息。"},
         ],
-        "max_tokens": 150,
-        "temperature": 0.9,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
     }).encode()
 
     req = urllib.request.Request(

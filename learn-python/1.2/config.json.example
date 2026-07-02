@@ -2,6 +2,9 @@
   "ai": {
     "api_key": "sk-your-api-key-here",
     "model": "gpt-4o-mini",
-    "base_url": "https://api.openai.com/v1"
+    "base_url": "https://api.openai.com/v1",
+    "max_tokens": 150,
+    "temperature": 0.9,
+    "context_size": 50
   }
 }

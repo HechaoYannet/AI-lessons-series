@@ -139,6 +139,7 @@ class PetState:
     chat_input: str = ""
     chat_reply: str = ""
     typing_progress: float = 0.0
+    chat_scroll: int = 0
 
     # Games
     reaction_game: ReactionGame | None = None
@@ -344,6 +345,19 @@ class TerminalPet:
                 self.pet.rename_buffer += key
             return
 
+        # Arrow key scrolling through chat history
+        if key == "\x1b[A":  # up
+            if self.pet.dialogue is not None and self.pet.dialogue.history:
+                self.pet.chat_scroll = min(
+                    self.pet.chat_scroll + 1,
+                    len(self.pet.dialogue.history) - 1,
+                )
+            return
+        if key == "\x1b[B":  # down
+            if self.pet.chat_scroll > 0:
+                self.pet.chat_scroll -= 1
+            return
+
         # Chat / number game input mode
         if self.pet.chatting or (self.pet.number_game is not None and self.pet.number_game.active):
             if key in {"\r", "\n"}:
@@ -470,7 +484,12 @@ class TerminalPet:
             ch = msvcrt.getwch()
             if ch in {"\x00", "\xe0"}:
                 if msvcrt.kbhit():
-                    _ = msvcrt.getwch()
+                    ch2 = msvcrt.getwch()
+                    # Arrow keys: up=H, down=P
+                    if ch2 == "H":
+                        self.handle_key("\x1b[A")  # up
+                    elif ch2 == "P":
+                        self.handle_key("\x1b[B")  # down
                 continue
             self.handle_key(ch)
 
@@ -557,15 +576,48 @@ class TerminalPet:
 
         # Game / chat / explore overlays
         extra_lines: list[str] = []
+
+        # Chat history window (always visible if history exists)
+        if self.pet.dialogue is not None and self.pet.dialogue.history:
+            visible_rows = 5
+            history = self.pet.dialogue.history
+            total = len(history)
+            # chat_scroll=0 means showing latest messages
+            start = max(0, total - visible_rows - self.pet.chat_scroll)
+            end = total - self.pet.chat_scroll
+            visible = history[start:end]
+
+            extra_lines.append(
+                f"{c('38;5;214')}╭─ 聊天记录 {'▼' if start > 0 else '┈'}"
+                f"{'▲' if end < total else '┈'} ──────╮{RESET}"
+            )
+            if not visible:
+                extra_lines.append(f"{c('38;5;214')}│{RESET} (滚动查看更早的消息)        {c('38;5;214')}│{RESET}")
+            for user_msg, pet_msg in visible:
+                # Truncate long messages for display
+                max_len = 35
+                u_disp = user_msg if len(user_msg) <= max_len else user_msg[:max_len - 1] + "…"
+                p_disp = pet_msg if len(pet_msg) <= max_len else pet_msg[:max_len - 1] + "…"
+                extra_lines.append(
+                    f"{c('38;5;214')}│{RESET} {c('38;5;246')}你:{RESET} {u_disp}"
+                )
+                extra_lines.append(
+                    f"{c('38;5;214')}│{RESET} {c('38;5;123')}{self.pet.name}:{RESET} {p_disp}"
+                )
+            extra_lines.append(f"{c('38;5;214')}╰────────────────────────────────────╯{RESET}")
+
+        # Chat input line
         if self.pet.chatting:
             if self.pet.chat_input:
-                extra_lines.append(f"{c('38;5;214')}对话{RESET}    > {self.pet.chat_input}_")
+                extra_lines.append(f"{c('38;5;214')}> {RESET}{self.pet.chat_input}_")
             else:
-                extra_lines.append(f"{c('38;5;214')}对话{RESET}    > _")
+                extra_lines.append(f"{c('38;5;214')}> {RESET}_")
             if self.pet.chat_reply:
                 visible = self.pet.chat_reply[:int(self.pet.typing_progress)]
                 prefix = "[AI] " if ai_available() and self.pet.chat_reply != "[AI思考中...]" else ""
-                extra_lines.append(f"{c('38;5;123')}回复{RESET}    {prefix}{visible}")
+                extra_lines.append(f"  {c('38;5;123')}{prefix}{visible}{RESET}")
+
+        # Game overlays
         if self.pet.reaction_game is not None and self.pet.reaction_game.active:
             rendered = self.pet.reaction_game.render().strip()
             if rendered:
@@ -638,6 +690,9 @@ class TerminalPet:
                 reply = ai_chat(history, self.pet.name, self.pet.mood, stats)
                 self.pet.chat_reply = reply
                 self.pet.typing_progress = 0.0
+                # Store in dialogue history
+                last_user = self.pet.dialogue.context[-1].replace("你: ", "")
+                self.pet.dialogue.history.append((last_user, reply))
             except Exception:
                 stats = self.pet.stats()
                 reply = self.pet.dialogue.respond(
